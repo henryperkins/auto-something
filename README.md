@@ -36,7 +36,7 @@ By automating the documentation process, Auto-Something not only saves time but 
 
 Here's a detailed **Installation and Configuration** section for the `README.md` that guides users through setting up Auto-Something:
 
-```markdown
+
 ## Installation and Configuration
 
 Follow these steps to install and configure Auto-Something for your development environment:
