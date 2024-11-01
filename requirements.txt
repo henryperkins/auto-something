@@ -7,3 +7,5 @@ tiktoken
 aiohttp
 pyyaml
 pydantic
+sentry-sdk
+sentence-transformers
