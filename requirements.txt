@@ -1,0 +1,9 @@
+asyncio
+tqdm
+openai
+python-dotenv
+black
+tiktoken
+aiohttp
+pyyaml
+pydantic
