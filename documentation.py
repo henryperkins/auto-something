@@ -1,70 +1,211 @@
 """
-Documentation module for analyzing Python functions and generating structured documentation.
+Documentation module for analyzing code and generating documentation.
 
-This module provides functions to analyze Python code using AI services, update source code
-with generated documentation, and format various documentation components.
+This module provides functionality to analyze code using AI services,
+managing different AI providers through a common interface. It handles
+response parsing, error management, and documentation formatting, with
+support for multi-language processing and context optimization.
+
+Classes:
+    AIServiceInterface: Abstract base class for AI service implementations.
+    OpenAIService: OpenAI-specific implementation of the AI service interface.
+    AzureOpenAIService: Azure OpenAI-specific implementation.
+    DocumentationGenerator: Main class for generating documentation.
+    AIResponseParser: Parser for AI service responses.
 """
 
 import os
-import ast
 import json
 import logging
+import asyncio
 import aiohttp
-from typing import Dict, Any, Optional
-from utils import get_function_hash, exponential_backoff_with_jitter
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Optional, List
+from dataclasses import dataclass
+import sentry_sdk
+from utils import exponential_backoff_with_jitter
+from context_manager import ContextManager, ContextWindowManager
+from hierarchy import CodeHierarchy
+from multilang import MultiLanguageManager
+from metadata_manager import MetadataManager
+from exceptions import AIServiceError, AIServiceConfigError, AIServiceResponseError
 
-def format_parameters(params):
-    """Format function parameters for documentation.
+@dataclass
+class AnalysisResult:
+    """Container for function analysis results."""
+    name: str
+    summary: str
+    docstring: str
+    changelog: str
+    complexity_score: Optional[int] = None
 
-    Args:
-        params (list): A list of tuples, each containing a parameter name and type.
+class AIServiceInterface(ABC):
+    """Abstract base class defining the interface for AI services."""
 
-    Returns:
-        str: A formatted string representing the parameters, with type annotations if available.
-    """
-    if not params:
-        return "None"
+    @abstractmethod
+    async def analyze_function(
+        self,
+        function_details: Dict[str, Any],
+        context_segments: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> AnalysisResult:
+        """
+        Analyze a function using the AI service.
 
-    formatted_params = []
-    for name, param_type in params:
-        if param_type and param_type != "Unknown":
-            formatted_params.append(f"{name}: {param_type}")
-        else:
-            formatted_params.append(name)
+        Args:
+            function_details: Dictionary containing function information
+            context_segments: Optional list of relevant code segments
+            metadata: Optional metadata about the function
 
-    return ", ".join(formatted_params)
+        Returns:
+            AnalysisResult containing the analysis
 
-def create_error_response(function_name):
-    """Create an error response for failed function analysis.
+        Raises:
+            AIServiceError: If analysis fails
+        """
+        pass
 
-    Args:
-        function_name (str): The name of the function that failed analysis.
+    @abstractmethod
+    async def validate_configuration(self) -> None:
+        """
+        Validate service configuration.
 
-    Returns:
-        dict: A dictionary containing error messages for summary, docstring, and changelog.
-    """
-    return {
-        "function_name": function_name,
-        "complexity_score": None,
-        "summary": "Error occurred during analysis",
-        "docstring": "Error: Documentation generation failed",
-        "changelog": "Error: Analysis failed",
-    }
+        Raises:
+            AIServiceConfigError: If configuration is invalid
+        """
+        pass
 
-async def analyze_function_with_openai(function_details: Dict[str, Any], service: str) -> Dict[str, Any]:
-    """
-    Analyze a function using OpenAI's API or Azure OpenAI service.
+class AIResponseParser:
+    """Parser for AI service responses."""
 
-    Args:
-        function_details (dict): A dictionary containing the function's code and metadata.
-        service (str): The AI service to use ('openai' or 'azure').
+    @staticmethod
+    def parse_response(response: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Parse and validate an AI service response.
 
-    Returns:
-        dict: A dictionary containing the analysis results, including summary, docstring, and changelog.
-    """
-    # Define the function schema for the expected response
-    function_schema = [
-        {
+        Args:
+            response: Raw response from the AI service
+
+        Returns:
+            Dictionary containing parsed response data
+
+        Raises:
+            AIServiceResponseError: If parsing fails
+        """
+        try:
+            if 'choices' not in response:
+                raise AIServiceResponseError("Invalid response format: missing 'choices'")
+
+            message = response['choices'][0].get('message', {})
+            
+            # Handle function call format
+            if 'function_call' in message:
+                try:
+                    args = json.loads(message['function_call']['arguments'])
+                    return {
+                        'summary': args.get('summary', ''),
+                        'docstring': args.get('docstring', ''),
+                        'changelog': args.get('changelog', '')
+                    }
+                except json.JSONDecodeError as e:
+                    raise AIServiceResponseError(f"Failed to parse function call arguments: {str(e)}")
+            
+            # Handle direct content format
+            elif 'content' in message:
+                try:
+                    content = message['content']
+                    if isinstance(content, str):
+                        # Attempt to parse as JSON
+                        try:
+                            return json.loads(content)
+                        except json.JSONDecodeError:
+                            # Fall back to basic content parsing
+                            return {
+                                'summary': content.strip(),
+                                'docstring': '',
+                                'changelog': 'Initial documentation'
+                            }
+                    elif isinstance(content, dict):
+                        return content
+                except Exception as e:
+                    raise AIServiceResponseError(f"Failed to parse message content: {str(e)}")
+            
+            raise AIServiceResponseError("Response format not recognized")
+            
+        except Exception as e:
+            if not isinstance(e, AIServiceResponseError):
+                raise AIServiceResponseError(f"Failed to parse response: {str(e)}")
+            raise
+
+class OpenAIService(AIServiceInterface):
+    """OpenAI service implementation."""
+
+    def __init__(self, api_key: str, model: str = "gpt-4"):
+        self.api_key = api_key
+        self.model = model
+        self.endpoint = "https://api.openai.com/v1/chat/completions"
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+    async def validate_configuration(self) -> None:
+        if not self.api_key:
+            raise AIServiceConfigError("OpenAI API key is not set")
+
+    async def analyze_function(
+        self,
+        function_details: Dict[str, Any],
+        context_segments: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> AnalysisResult:
+        try:
+            await self.validate_configuration()
+            
+            prompt = self._create_prompt(function_details, context_segments, metadata)
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "You are a code documentation expert."},
+                    {"role": "user", "content": prompt}
+                ],
+                "functions": [self._get_function_schema()],
+                "function_call": {"name": "analyze_and_document_function"},
+                "temperature": 0.2
+            }
+
+            async with aiohttp.ClientSession() as session:
+                completion = await exponential_backoff_with_jitter(
+                    lambda: self._make_request(session, payload)
+                )
+
+            parsed_response = AIResponseParser.parse_response(completion)
+            
+            return AnalysisResult(
+                name=function_details["name"],
+                summary=parsed_response["summary"],
+                docstring=parsed_response["docstring"],
+                changelog=parsed_response["changelog"],
+                complexity_score=function_details.get("complexity")
+            )
+
+        except AIServiceError:
+            raise
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            raise AIServiceError(f"OpenAI service error: {str(e)}")
+
+    async def _make_request(self, session: aiohttp.ClientSession, payload: Dict) -> Dict:
+        """Make a request to the OpenAI API."""
+        async with session.post(self.endpoint, json=payload, headers=self.headers) as response:
+            if response.status != 200:
+                error_detail = await response.text()
+                raise AIServiceError(f"OpenAI API request failed with status {response.status}: {error_detail}")
+            return await response.json()
+
+    def _get_function_schema(self) -> Dict[str, Any]:
+        """Get the function schema for the API."""
+        return {
             "name": "analyze_and_document_function",
             "description": "Analyzes a Python function and provides structured documentation",
             "parameters": {
@@ -72,292 +213,302 @@ async def analyze_function_with_openai(function_details: Dict[str, Any], service
                 "properties": {
                     "summary": {
                         "type": "string",
-                        "description": "Concise description of function purpose and behavior",
+                        "description": "Concise description of function purpose"
                     },
                     "docstring": {
                         "type": "string",
-                        "description": "Complete Google-style docstring including exceptions and side effects",
+                        "description": "Complete Google-style docstring"
                     },
                     "changelog": {
                         "type": "string",
-                        "description": "Documentation change history or 'Initial documentation'",
-                    },
+                        "description": "Documentation change history"
+                    }
                 },
-                "required": ["summary", "docstring", "changelog"],
-            },
+                "required": ["summary", "docstring", "changelog"]
+            }
         }
-    ]
 
-    # Process dependency information
-    dependencies = function_details.get("dependencies", {})
-    dependency_info = []
-    
-    # Add exception information
-    if dependencies.get("raises"):
-        dependency_info.append("Raises Exceptions:")
-        for exc in dependencies["raises"]:
-            dependency_info.append(f"- {exc['exception']}: {exc['context']}")
-    
-    # Add significant operations
-    if dependencies.get("uses"):
-        dependency_info.append("\nSignificant Operations:")
-        for op in dependencies["uses"]:
-            dependency_info.append(f"- {op['operation']}: {op['context']}")
-    
-    # Add side effects
-    if dependencies.get("affects"):
-        dependency_info.append("\nSide Effects:")
-        for effect in dependencies["affects"]:
-            dependency_info.append(f"- Modifies: {effect['attribute']}")
-    
-    # Add import dependencies
-    if dependencies.get("imports"):
-        dependency_info.append("\nKey Dependencies:")
-        for imp in dependencies["imports"]:
-            if imp.get("is_type_hint") or imp["name"] in ["typing", "dataclasses", "abc"]:
-                dependency_info.append(f"- {imp['module']}.{imp['name']} (type hints)")
-
-    # Format dependency section
-    dependency_section = "\n".join(dependency_info) if dependency_info else "No significant dependencies or side effects"
-
-    # Prepare the prompts for the AI service
-    system_prompt = (
-        "You are a documentation specialist that analyzes Python functions and generates structured documentation. "
-        "Focus on capturing function behavior, dependencies, exceptions, and side effects in the documentation. "
-        "Always return responses in the following JSON format:\n"
-        "{\n"
-        "    'summary': '<concise function description>',\n"
-        "    'docstring': '<Google-style docstring>',\n"
-        "    'changelog': '<change history>'\n"
-        "}"
-    )
-    
-    user_prompt = (
-        f"Analyze and document this function:\n\n"
-        f"Function Name: {function_details['name']}\n"
-        f"Parameters: {format_parameters(function_details['params'])}\n"
-        f"Return Type: {function_details['return_type']}\n"
-        f"Existing Docstring: {function_details['docstring'] or 'None'}\n\n"
-        f"Dependencies and Effects:\n{dependency_section}\n\n"
-        f"Source Code:\n"
-        f"```python\n{function_details['code']}\n```\n\n"
-        f"Requirements:\n"
-        f"1. Generate a Google-style docstring\n"
-        f"2. Include type hints if present\n"
-        f"3. Document any exceptions that may be raised\n"
-        f"4. Document any significant side effects\n"
-        f"5. Provide a clear, concise summary\n"
-        f"6. Include a changelog entry"
-    )
-
-    try:
-        # Configure API based on the selected service
-        if service == "openai":
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                raise ValueError("OPENAI_API_KEY environment variable is not set")
-            
-            endpoint = "https://api.openai.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            model = "gpt-4-0125-preview"
-            
-        else:  # Azure OpenAI service
-            api_key = os.getenv("AZURE_OPENAI_API_KEY")
-            endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-            deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-            
-            if not all([api_key, endpoint, deployment_name]):
-                raise ValueError("Required Azure OpenAI environment variables are not set")
-            
-            endpoint = f"{endpoint}/openai/deployments/{deployment_name}/chat/completions?api-version=2024-02-15-preview"
-            headers = {
-                "api-key": api_key,
-                "Content-Type": "application/json"
-            }
-            model = deployment_name
-
-        async def make_request():
-            """Make an asynchronous request to the AI service."""
-            async with aiohttp.ClientSession() as session:
-                payload = {
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    "functions": function_schema,
-                    "function_call": {"name": "analyze_and_document_function"},
-                    "temperature": 0.2
-                }
-                
-                # Remove functions for Azure if not supported
-                if service == "azure":
-                    del payload["functions"]
-                    del payload["function_call"]
-                
-                async with session.post(endpoint, json=payload, headers=headers) as response:
-                    if response.status != 200:
-                        error_detail = await response.text()
-                        raise ValueError(f"API request failed with status {response.status}: {error_detail}")
-                    return await response.json()
-
-        # Make API request with exponential backoff
-        completion = await exponential_backoff_with_jitter(make_request)
+    def _create_prompt(
+        self,
+        function_details: Dict[str, Any],
+        context_segments: Optional[List[str]],
+        metadata: Optional[Dict[str, Any]]
+    ) -> str:
+        """Create the prompt for the AI service."""
+        parts = []
         
-        if 'error' in completion:
-            logging.error(f"API returned an error: {completion['error']}")
-            return create_error_response(function_details["name"])
+        # Add context if available
+        if context_segments:
+            context = "\n\n".join(context_segments)
+            parts.append(f"Additional Context:\n```python\n{context}\n```\n")
+        
+        # Add metadata if available
+        if metadata:
+            meta_str = json.dumps(metadata, indent=2)
+            parts.append(f"Metadata:\n```json\n{meta_str}\n```\n")
+        
+        # Add function details
+        parts.extend([
+            f"Function Name: {function_details['name']}",
+            f"Parameters: {', '.join(f'{p[0]}: {p[1]}' for p in function_details.get('params', []))}",
+            f"Return Type: {function_details.get('return_type', 'None')}",
+            f"Existing Docstring: {function_details.get('docstring', 'None')}",
+            "",
+            "Source Code:",
+            f"```python\n{function_details['code']}\n```"
+        ])
+        
+        return "\n".join(parts)
 
-        response_message = completion.get('choices', [{}])[0].get('message', {})
-        if not response_message:
-            raise KeyError("Missing 'choices' or 'message' in response")
+class AzureOpenAIService(AIServiceInterface):
+    """Azure OpenAI service implementation."""
 
-        # Parse response based on service type
-        if service == "openai" and 'function_call' in response_message:
-            function_args = json.loads(response_message['function_call']['arguments'])
-        else:
-            try:
-                content = response_message.get('content', '{}')
-                function_args = json.loads(content)
-            except json.JSONDecodeError:
-                function_args = {
-                    "summary": response_message.get('content', '').strip(),
-                    "docstring": function_details.get("docstring", ""),
-                    "changelog": "Initial documentation"
-                }
-
-        result = {
-            "function_name": function_details["name"],
-            "complexity_score": function_details.get("complexity_score"),
-            "summary": function_args["summary"].strip(),
-            "docstring": format_docstring(function_args["docstring"]),
-            "changelog": function_args["changelog"].strip(),
+    def __init__(self, api_key: str, endpoint: str, deployment_name: str):
+        self.api_key = api_key
+        self.endpoint = endpoint
+        self.deployment_name = deployment_name
+        self.headers = {
+            "api-key": api_key,
+            "Content-Type": "application/json"
         }
 
-        return result
+    async def validate_configuration(self) -> None:
+        if not all([self.api_key, self.endpoint, self.deployment_name]):
+            raise AIServiceConfigError("Azure OpenAI configuration is incomplete")
 
-    except Exception as e:
-        logging.error(f"An error occurred during function analysis: {str(e)}")
-        return create_error_response(function_details["name"])
-    
-def update_function_docstring(node: ast.AST, docstring: str):
-    """Update the docstring of an AST node.
+    async def analyze_function(
+        self,
+        function_details: Dict[str, Any],
+        context_segments: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> AnalysisResult:
+        try:
+            await self.validate_configuration()
+            
+            prompt = OpenAIService._create_prompt(self, function_details, context_segments, metadata)
+            endpoint = f"{self.endpoint}/openai/deployments/{self.deployment_name}/chat/completions?api-version=2024-02-15-preview"
+            
+            payload = {
+                "messages": [
+                    {"role": "system", "content": "You are a code documentation expert."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.2
+            }
 
-    This function modifies the AST node of a function to update its docstring,
-    ensuring that the new docstring is properly inserted or replaced.
-
-    Args:
-        node (ast.AST): The AST node of the function.
-        docstring (str): The new docstring to insert.
-    """
-    if node.body:
-        first_node = node.body[0]
-        if isinstance(first_node, ast.Expr) and isinstance(first_node.value, ast.Constant):
-            first_node.value.value = docstring
-        else:
-            node.body.insert(0, ast.Expr(value=ast.Constant(value=docstring)))
-    ast.fix_missing_locations(node)
-
-def update_source_code(filepath: str, functions_analysis: list) -> bool:
-    """
-    Update source code with new docstrings.
-
-    This function parses the source code file into an AST, updates the docstrings
-    of functions based on the analysis results, and writes the updated code back
-    to the file if modifications were made.
-
-    Args:
-        filepath (str): Path to the source file.
-        functions_analysis (list): Analysis results for functions in the file.
-
-    Returns:
-        bool: True if the source code was updated, False otherwise.
-    """
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            source = f.read()
-
-        tree = ast.parse(source)
-        modified = False
-
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                analysis = next(
-                    (a for a in functions_analysis if a["function_name"] == node.name),
-                    None
+            async with aiohttp.ClientSession() as session:
+                completion = await exponential_backoff_with_jitter(
+                    lambda: self._make_request(session, endpoint, payload)
                 )
 
-                if analysis and analysis["docstring"]:
-                    update_function_docstring(node, analysis["docstring"])
-                    modified = True
-
-        if modified:
-            updated_source = ast.unparse(tree)
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(updated_source)
-
-            logging.info(f"Updated source code in {filepath}")
-            return True
+            parsed_response = AIResponseParser.parse_response(completion)
             
-        return False
+            return AnalysisResult(
+                name=function_details["name"],
+                summary=parsed_response["summary"],
+                docstring=parsed_response["docstring"],
+                changelog=parsed_response["changelog"],
+                complexity_score=function_details.get("complexity")
+            )
+
+        except AIServiceError:
+            raise
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            raise AIServiceError(f"Azure OpenAI service error: {str(e)}")
+
+    async def _make_request(
+        self,
+        session: aiohttp.ClientSession,
+        endpoint: str,
+        payload: Dict
+    ) -> Dict:
+        """Make a request to the Azure OpenAI API."""
+        async with session.post(endpoint, json=payload, headers=self.headers) as response:
+            if response.status != 200:
+                error_detail = await response.text()
+                raise AIServiceError(
+                    f"Azure OpenAI API request failed with status {response.status}: {error_detail}"
+                )
+            return await response.json()
+
+class DocumentationGenerator:
+    """Main class for generating documentation using AI services."""
+
+    def __init__(self, 
+                 service: AIServiceInterface,
+                 context_manager: ContextManager,
+                 hierarchy_manager: CodeHierarchy,
+                 multilang_manager: MultiLanguageManager,
+                 metadata_manager: MetadataManager):
+        """
+        Initialize the documentation generator.
         
-    except Exception as e:
-        logging.error(f"Error updating source code in {filepath}: {str(e)}")
-        return False
+        Args:
+            service: AI service interface
+            context_manager: Context management instance
+            hierarchy_manager: Hierarchy management instance
+            multilang_manager: Multi-language support instance
+            metadata_manager: Metadata management instance
+        """
+        self.service = service
+        self.context_manager = context_manager
+        self.hierarchy_manager = hierarchy_manager
+        self.multilang_manager = multilang_manager
+        self.metadata_manager = metadata_manager
+        self.window_manager = ContextWindowManager()
 
-def format_changelog(changelog: str) -> str:
-    """Format changelog entries for documentation.
+    async def analyze_function(
+        self,
+        function_details: Dict[str, Any],
+        context_segments: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> AnalysisResult:
+        """
+        Analyze a function and generate documentation.
 
-    Args:
-        changelog (str): A string containing changelog entries.
+        Args:
+            function_details: Dictionary containing function information
+            context_segments: Optional list of relevant code segments
+            metadata: Optional metadata about the function
 
-    Returns:
-        str: A formatted string with each entry prefixed by a dash.
-    """
-    if not changelog:
-        return "_No changelog available_"
+        Returns:
+            AnalysisResult containing the analysis
 
-    entries = changelog.split("\n")
-    formatted_entries = []
+        Raises:
+            AIServiceError: If analysis fails
+        """
+        try:
+            # Detect language if not specified
+            if 'language' not in metadata:
+                detected_lang = await self.multilang_manager.detect_language(
+                    function_details['code']
+                )
+                metadata['language'] = detected_lang
 
-    for entry in entries:
-        entry = entry.strip()
-        if entry:
-            if not entry.startswith("- "):
-                entry = f"- {entry}"
-            formatted_entries.append(entry)
+            # Update hierarchy
+            hierarchy_path = self.hierarchy_manager.add_node(
+                path=function_details['name'],
+                node_type='function',
+                documentation=function_details.get('docstring'),
+                metadata=metadata
+            ).get_path()
 
-    return "\n".join(formatted_entries)
+            # Optimize context window
+            context = await self.window_manager.optimize_window()
+            if context_segments:
+                optimized_segments = await self.context_manager.get_semantic_relevant_segments(
+                    context_segments,
+                    target_tokens=self.window_manager.target_tokens
+                )
+                context_segments = optimized_segments
 
-def format_docstring(docstring: str) -> str:
-    """Format a docstring with proper indentation.
+            # Generate documentation
+            result = await self.service.analyze_function(
+                function_details,
+                context_segments,
+                {
+                    **metadata,
+                    'hierarchy_path': hierarchy_path,
+                    'language': metadata['language']
+                }
+            )
 
-    Args:
-        docstring (str): The raw docstring to format.
+            # Synchronize metadata with context information
+            await self.metadata_manager.sync_with_context(
+                function_details['name'],
+                self.window_manager.get_segment_score(function_details['name']),
+                time.time()
+            )
 
-    Returns:
-        str: A formatted docstring with consistent indentation.
-    """
-    if not docstring:
-        return "No documentation available"
+            return result
 
-    lines = docstring.splitlines()
-    if not lines:
-        return docstring
+        except Exception as e:
+            logging.error(f"Error analyzing function {function_details['name']}: {str(e)}")
+            sentry_sdk.capture_exception(e)
+            raise
 
-    def get_indent(line):
-        return len(line) - len(line.lstrip()) if line.strip() else float("inf")
+    async def analyze_code_file(
+        self,
+        filepath: str,
+        content: str,
+        config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Analyze a complete code file.
 
-    min_indent = min(get_indent(line) for line in lines if line.strip())
-    
-    cleaned_lines = []
-    for line in lines:
-        if line.strip():
-            cleaned_lines.append(line[min_indent:] if len(line) >= min_indent else line)
-        else:
-            cleaned_lines.append("")
+        Args:
+            filepath: Path to the file
+            content: File content
+            config: Configuration dictionary
 
-    return "\n".join(cleaned_lines)
+        Returns:
+            Dictionary containing analysis results
+        """
+        try:
+            # Process file with multi-language support
+            parsed_file = await self.multilang_manager.process_file(filepath, content)
+            
+            if parsed_file.errors:
+                logging.warning(f"Errors parsing {filepath}: {parsed_file.errors}")
+                return {'errors': parsed_file.errors}
+
+            # Create hierarchy nodes for file structure
+            file_node = self.hierarchy_manager.add_node(
+                path=filepath,
+                node_type='file',
+                metadata={'language': parsed_file.language}
+            )
+
+            results = {
+                'language': parsed_file.language,
+                'elements': []
+            }
+
+            for element in parsed_file.content.get('functions', []) + \
+                        parsed_file.content.get('classes', []):
+                try:
+                    # Optimize context for each element
+                    context = await self.window_manager.get_optimized_context()
+                    
+                    # Generate documentation
+                    element_result = await self.analyze_function(
+                        element,
+                        context_segments=context,
+                        metadata={
+                            'file_path': filepath,
+                            'language': parsed_file.language,
+                            'parent_node': file_node.get_path()
+                        }
+                    )
+                    
+                    results['elements'].append(element_result)
+                    
+                except Exception as e:
+                    logging.error(f"Error analyzing element {element.get('name')}: {str(e)}")
+                    sentry_sdk.capture_exception(e)
+                    results['elements'].append({
+                        'name': element.get('name'),
+                        'error': str(e)
+                    })
+
+            return results
+
+        except Exception as e:
+            logging.error(f"Error analyzing code file {filepath}: {str(e)}")
+            sentry_sdk.capture_exception(e)
+            return {'error': str(e)}
+
+    async def generate_cross_references(self) -> Dict[str, List[str]]:
+        """
+        Generate cross-references between documented elements.
+
+        Returns:
+            Dictionary of cross-references
+        """
+        try:
+            return await self.multilang_manager.get_cross_references()
+        except Exception as e:
+            logging.error(f"Error generating cross-references: {str(e)}")
+            sentry_sdk.capture_exception(e)
+            return {}

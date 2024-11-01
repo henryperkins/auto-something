@@ -1,10 +1,19 @@
-# main.py
 """
 Main module for the documentation generator.
 
-This module serves as the entry point for the application, handling command-line
-arguments, configuration loading, repository management, and the workflow for
-processing files and generating documentation.
+This module serves as the entry point for the application, orchestrating the
+documentation generation process across multiple languages and managing hierarchical
+organization of code documentation with optimized context handling.
+
+Functions:
+    main: Main entry point for the application.
+    main_async: Asynchronous main function implementing the core application logic.
+    create_arg_parser: Create and configure the argument parser.
+    process_repository: Process a repository and generate documentation.
+    clone_repository: Clone a Git repository.
+    get_repository_files: Get list of files to process from repository.
+    generate_documentation: Generate documentation from processing results.
+    display_statistics: Display documentation generation statistics.
 """
 
 import os
@@ -13,74 +22,124 @@ import asyncio
 import argparse
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, List
+import logging
+import signal
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+import sentry_sdk
 
 from config import Config, create_default_config
 from cache import Cache
-from validation import (
-    CLIArguments,
-    validate_input_files,
-    validate_git_repository
-)
+from validation import validate_input_files, validate_git_repository, ValidationError
 from utils import setup_logging, get_all_files, clone_repo
-from workflow import process_files, write_analysis_to_markdown
-from dotenv import load_dotenv  # Import dotenv to load environment variables
+from workflow import process_files
+from hierarchy import CodeHierarchy
+from multilang import MultiLanguageManager
+from context_manager import ContextManager, ContextWindowManager
+from metadata_manager import MetadataManager
+from exceptions import ConfigurationError
 
-def validate_service_configuration(service: str) -> None:
+# Initialize Sentry
+sentry_sdk.init(
+    dsn="your-sentry-dsn-here",
+    traces_sample_rate=1.0,
+    environment="production",
+    release="my-project-name@2.3.12",
+    debug=True,
+    attach_stacktrace=True,
+    send_default_pii=False
+)
+
+class ApplicationManager:
     """
-    Validate that required environment variables are set for the selected service.
+    Manages the application's core components and lifecycle.
     
-    Args:
-        service: The selected service ('openai' or 'azure')
-        
-    Raises:
-        ValueError: If required environment variables are missing
+    This class coordinates between different components and ensures proper
+    initialization and cleanup of resources.
     """
-    if service == "azure":
-        required_vars = {
-            "AZURE_OPENAI_API_KEY": os.getenv("AZURE_OPENAI_API_KEY"),
-            "AZURE_OPENAI_ENDPOINT": os.getenv("AZURE_OPENAI_ENDPOINT"),
-            "AZURE_OPENAI_DEPLOYMENT_NAME": os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+    
+    def __init__(self, config: Config):
+        """Initialize the application manager."""
+        self.config = config
+        self.cache = None
+        self.hierarchy = None
+        self.multilang = None
+        self.context = None
+        self.window_manager = None
+        self.metadata_manager = None
+        
+    async def initialize(self):
+        """Initialize all components."""
+        # Initialize cache
+        if self.config.cache.enabled:
+            self.cache = Cache(self.config.cache)
+            
+        # Initialize managers
+        self.hierarchy = CodeHierarchy()
+        self.multilang = MultiLanguageManager(self.config.multilang)
+        self.context = ContextManager(
+            context_size_limit=self.config.model.context_size_limit,
+            max_tokens=self.config.model.max_tokens,
+            model_name=self.config.model.model
+        )
+        self.window_manager = ContextWindowManager(
+            model_name=self.config.model.model,
+            max_tokens=self.config.model.max_tokens,
+            target_token_usage=self.config.context_optimizer.target_token_usage
+        )
+        self.metadata_manager = MetadataManager(db_path=".metadata_store.db")
+        
+    async def cleanup(self):
+        """Clean up resources."""
+        try:
+            if self.cache:
+                await self.cache.clear()
+            if self.context:
+                await self.context.cleanup()
+            if self.multilang:
+                self.multilang.cleanup()
+            if self.window_manager:
+                await self.window_manager.cleanup()
+            if self.metadata_manager:
+                self.metadata_manager.cleanup()
+        except Exception as e:
+            logging.error(f"Error during cleanup: {e}")
+            raise
+
+    async def export_hierarchy(self, output_path: str):
+        """Export the documentation hierarchy."""
+        if self.hierarchy:
+            self.hierarchy.save_to_file(output_path)
+            
+    async def get_statistics(self) -> Dict[str, Any]:
+        """Get statistics about the documentation process."""
+        stats = {
+            'hierarchy': {
+                'total_nodes': len(list(self.hierarchy.iterate_nodes())),
+                'max_depth': max(node.get_path().count('.') for node in 
+                               self.hierarchy.iterate_nodes())
+            },
+            'languages': {},
+            'context': await self.context.get_context_stats()
         }
         
-        missing_vars = [var for var, value in required_vars.items() if not value]
-        
-        if missing_vars:
-            raise ValueError(
-                f"Missing required Azure OpenAI environment variables: {', '.join(missing_vars)}\n"
-                f"Please set these in your .env file or environment."
-            )
+        # Collect language statistics
+        for filepath, parsed in self.multilang.parsed_files.items():
+            lang = parsed.language
+            if lang not in stats['languages']:
+                stats['languages'][lang] = 0
+            stats['languages'][lang] += 1
             
-    elif service == "openai":
-        if not os.getenv("OPENAI_API_KEY"):
-            raise ValueError(
-                "Missing OPENAI_API_KEY environment variable.\n"
-                "Please set this in your .env file or environment."
-            )
+        return stats
 
-def create_arg_parser():
-    """Create and configure the argument parser.
-
-    Returns:
-        argparse.ArgumentParser: Configured argument parser with all necessary options.
-    """
-    parser = argparse.ArgumentParser(description="Analyze a GitHub repository or local directory.")
-    
-    # Option to create a default configuration file
-    parser.add_argument(
-        "--create-config",
-        action="store_true",
-        help="Create a default configuration file and exit"
+def create_arg_parser() -> argparse.ArgumentParser:
+    """Create and configure the argument parser."""
+    parser = argparse.ArgumentParser(
+        description="AI-powered documentation generator with multi-language support"
     )
     
-    # Option to clear the cache
-    parser.add_argument(
-        "--clear-cache",
-        action="store_true",
-        help="Clear the cache and exit"
-    )
-    
-    # Input path and output file are optional if --create-config or --clear-cache is used
+    # Basic options
     parser.add_argument(
         "input_path",
         nargs="?",
@@ -89,213 +148,232 @@ def create_arg_parser():
     parser.add_argument(
         "output_file",
         nargs="?",
-        help="File to save Markdown output"
+        help="Output documentation file path"
     )
     
-    # Concurrency level for processing
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=5,
-        help="Number of concurrent requests to OpenAI"
-    )
-    
-    # AI service selection
-    parser.add_argument(
-        "--service",
-        choices=["openai", "azure"],
-        default="openai",
-        help="Select the AI service to use: 'openai' or 'azure'"
-    )
-    
-    # Path to the configuration file
-    parser.add_argument(
+    # Configuration
+    config_group = parser.add_argument_group('Configuration')
+    config_group.add_argument(
         "--config",
         type=str,
         default="config.yaml",
         help="Path to configuration file"
     )
+    config_group.add_argument(
+        "--create-config",
+        action="store_true",
+        help="Create default configuration file"
+    )
+    
+    # Language support
+    lang_group = parser.add_argument_group('Language Support')
+    lang_group.add_argument(
+        "--languages",
+        nargs="+",
+        help="Specific languages to process (default: all supported)"
+    )
+    
+    # Hierarchy options
+    hierarchy_group = parser.add_argument_group('Hierarchy')
+    hierarchy_group.add_argument(
+        "--hierarchy-output",
+        type=str,
+        help="Output path for hierarchy data"
+    )
+    hierarchy_group.add_argument(
+        "--group-by",
+        choices=["module", "language", "type"],
+        default="module",
+        help="Primary grouping criterion"
+    )
+    
+    # Context management
+    context_group = parser.add_argument_group('Context Management')
+    context_group.add_argument(
+        "--context-size",
+        type=int,
+        help="Override default context window size"
+    )
+    context_group.add_argument(
+        "--optimize-context",
+        action="store_true",
+        help="Enable context optimization"
+    )
     
     return parser
 
-async def main():
-    """Main entry point for the documentation generator.
-
-    This function orchestrates the entire workflow, including argument parsing,
-    configuration loading, repository handling, file processing, and documentation
-    generation. It uses asynchronous programming to handle concurrent tasks efficiently.
-    """
-    # Set up argument parser
-    parser = create_arg_parser()
-    args = parser.parse_args()
-
-    # Load environment variables
-    load_dotenv()
-    
-    # Validate service configuration
-    try:
-        validate_service_configuration(args.service)
-    except ValueError as e:
-        print(f"Error: {e}")
-        print("\nWould you like to create/edit the .env file now? (y/n)")
-        if input().lower() == 'y':
-            env_path = '.env'
-            if os.path.exists(env_path):
-                print(f"\nCurrent {env_path} content:")
-                with open(env_path, 'r') as f:
-                    print(f.read())
-            
-            print("\nPlease edit the .env file with your API keys and try again.")
-            if not os.path.exists(env_path):
-                with open(env_path, 'w') as f:
-                    f.write("""# OpenAI Configuration
-OPENAI_API_KEY=your-api-key-here
-
-# Azure OpenAI Configuration
-AZURE_OPENAI_API_KEY=your-azure-key-here
-AZURE_OPENAI_ENDPOINT=https://your-resource-name.openai.azure.com
-AZURE_OPENAI_DEPLOYMENT_NAME=your-deployment-name
-""")
-                print(f"Created {env_path} file. Please edit it with your API keys.")
-        sys.exit(1)
-
-    # Handle config creation request
-    if args.create_config:
-        config_path = args.config if args.config else "config.yaml"
-        create_default_config(config_path)
-        print(f"Created default configuration file '{config_path}'")
-        print("Please edit it with your API keys and preferences")
-        sys.exit(0)
-
-    # Load configuration
-    config = Config.load(args.config)
-
-    # Initialize cache
-    cache = Cache(config.cache)
-
-    # Handle cache clearing request
-    if args.clear_cache:
-        cache.clear()
-        print("Cache cleared successfully.")
-        sys.exit(0)
-
-    # Check for required arguments
-    if not args.input_path or not args.output_file:
-        parser.error("input_path and output_file are required unless --create-config or --clear-cache is used")
-
-    # Check for config file and create if it doesn't exist
-    if not os.path.exists(args.config):
-        print(f"Configuration file '{args.config}' not found.")
-        print("Would you like to create a default configuration file? (y/n)")
-        if input().lower() == 'y':
-            create_default_config(args.config)
-            print(f"Created default configuration file '{args.config}'")
-            print("Please edit it with your API keys and preferences")
-            sys.exit(0)
-        else:
-            print("Cannot proceed without configuration file.")
-            sys.exit(1)
-
-    # Setup logging
-    setup_logging()
-
-    try:
-        # Validate CLI arguments
-        cli_args = CLIArguments(
-            input_path=args.input_path,
-            output_file=args.output_file,
-            concurrency=args.concurrency,
-            service=args.service,
-            config_file=args.config
-        )
-    except ValueError as e:
-        print(f"Error in command line arguments: {str(e)}")
-        sys.exit(1)
-
-    # Load configuration
-    try:
-        config = Config.load(cli_args.config_file)
-        config_errors = config.validate()
-        if config_errors:
-            print("Configuration errors:")
-            for error in config_errors:
-                print(f"  - {error}")
-            sys.exit(1)
-    except Exception as e:
-        print(f"Error loading configuration: {str(e)}")
-        sys.exit(1)
-
+async def process_repository(
+    app: ApplicationManager,
+    args: argparse.Namespace
+) -> None:
+    """Process a repository and generate documentation."""
     cleanup_needed = False
     repo_dir = None
-
+    
     try:
-        # Handle repository cloning if needed
-        if cli_args.input_path.startswith(("http://", "https://")):
-            try:
-                # Validate the Git repository URL
-                repo_validation = validate_git_repository(cli_args.input_path)
-                repo_dir = "cloned_repo"
-                # Clone the repository to a local directory
-                clone_repo(str(repo_validation.url), repo_dir)
-                cleanup_needed = True
-            except ValueError as e:
-                print(f"Error with repository URL: {str(e)}")
-                sys.exit(1)
+        # Handle repository
+        if args.input_path.startswith(("http://", "https://")):
+            repo_dir = await clone_repository(args.input_path)
+            cleanup_needed = True
         else:
-            # Use the local directory as the repository directory
-            repo_dir = cli_args.input_path
-            if not os.path.isdir(repo_dir):
-                print(f"Error: The directory {repo_dir} does not exist.")
-                sys.exit(1)
-
-        # Get list of Python files
-        try:
-            # Retrieve all Python files from the repository directory
-            files_list = get_all_files(repo_dir, exclude_dirs=config.exclude_dirs)
-            # Validate the retrieved files
-            validated_files = validate_input_files(files_list)
-        except ValueError as e:
-            print(f"Error with input files: {str(e)}")
-            sys.exit(1)
-        
-        # Process files and generate documentation
-        try:
-            # Asynchronously process the validated files to generate documentation
-            results = await process_files(
-                validated_files,
-                repo_dir,
-                config.concurrency_limit,
-                cli_args.service,
-                cache
-            )
-        except Exception as e:
-            print(f"Error processing files: {str(e)}")
-            sys.exit(1)
-        
-        # Write results to markdown
-        try:
-            # Write the analysis results to a Markdown file
-            write_analysis_to_markdown(results, cli_args.output_file, repo_dir)
-            print(f"\nAnalysis complete! Documentation has been written to {cli_args.output_file}")
+            repo_dir = args.input_path
             
-            # Print cache statistics if caching is enabled
-            if config.cache.enabled:
-                stats = cache.get_stats()
-                print("\nCache Statistics:")
-                print(f"  Total Size: {stats['total_size_mb']:.2f} MB")
-                print(f"  Entry Count: {stats.get('function_count', 0)}")
-                print(f"  Module Count: {stats.get('module_count', 0)}")
-                print(f"  Average Entry Age: {stats['avg_age_hours']:.1f} hours")
-                
-        except Exception as e:
-            print(f"Error writing output: {str(e)}")
-            sys.exit(1)
-
+        # Get and validate files
+        files = await get_repository_files(repo_dir, app.config)
+        
+        # Process files
+        results = await process_files(
+            files,
+            repo_dir,
+            app.config,
+            multilang_manager=app.multilang,
+            hierarchy_manager=app.hierarchy,
+            context_manager=app.context,
+            window_manager=app.window_manager,
+            cache=app.cache
+        )
+        
+        # Generate documentation
+        await generate_documentation(results, args.output_file, app)
+        
+        # Export hierarchy if requested
+        if args.hierarchy_output:
+            await app.export_hierarchy(args.hierarchy_output)
+            
+        # Display statistics
+        stats = await app.get_statistics()
+        display_statistics(stats)
+        
     finally:
-        # Clean up cloned repository if necessary
         if cleanup_needed and repo_dir and os.path.exists(repo_dir):
             shutil.rmtree(repo_dir)
-            print(f"Cleaned up cloned repository at {repo_dir}")
+
+async def clone_repository(url: str) -> str:
+    """Clone a Git repository."""
+    repo_dir = "cloned_repo"
+    if os.path.exists(repo_dir):
+        shutil.rmtree(repo_dir)
+    await clone_repo(url, repo_dir)
+    return repo_dir
+
+async def get_repository_files(repo_dir: str, config: Config) -> List[str]:
+    """Get list of files to process from repository."""
+    files = await get_all_files(repo_dir, config.exclude_dirs)
+    return validate_input_files(files)
+
+async def generate_documentation(
+    results: Dict[str, Any],
+    output_file: str,
+    app: ApplicationManager
+) -> None:
+    """Generate documentation from processing results."""
+    from workflow import write_analysis_to_markdown
+    
+    # Organize results by hierarchy
+    organized_results = app.hierarchy.organize_results(results)
+    
+    # Generate cross-references
+    cross_refs = await app.multilang.get_cross_references()
+    
+    # Write documentation
+    await write_analysis_to_markdown(
+        organized_results,
+        output_file,
+        cross_references=cross_refs,
+        hierarchy=app.hierarchy
+    )
+
+def display_statistics(stats: Dict[str, Any]) -> None:
+    """Display documentation generation statistics."""
+    print("\nDocumentation Generation Statistics:")
+    print("\nHierarchy Information:")
+    print(f"  Total Nodes: {stats['hierarchy']['total_nodes']}")
+    print(f"  Maximum Depth: {stats['hierarchy']['max_depth']}")
+    
+    print("\nLanguage Distribution:")
+    for lang, count in stats['languages'].items():
+        print(f"  {lang}: {count} files")
+    
+    print("\nContext Statistics:")
+    print(f"  Total Segments: {stats['context']['total_segments']}")
+    print(f"  Token Usage: {stats['context']['total_tokens']}/{stats['context']['max_tokens']}")
+    print(f"  Utilization: {stats['context']['utilization']:.2%}")
+
+def setup_signal_handlers(app: ApplicationManager):
+    """Set up signal handlers for graceful shutdown."""
+    def signal_handler(signum, frame):
+        logging.info(f"Received signal {signum}. Starting cleanup...")
+        asyncio.run(app.cleanup())
+        sys.exit(0)
+        
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+async def main_async():
+    """Asynchronous main function."""
+    app = None
+    try:
+        # Load environment variables
+        load_dotenv()
+        
+        # Parse arguments
+        parser = create_arg_parser()
+        args = parser.parse_args()
+        
+        # Handle configuration
+        if args.create_config:
+            create_default_config(args.config)
+            print(f"Created default configuration at: {args.config}")
+            return
+            
+        # Load configuration
+        config = Config.load(args.config)
+        
+        # Validate configuration
+        validate_configuration(config)
+        
+        # Setup logging
+        setup_logging(config)
+        
+        # Initialize application
+        app = ApplicationManager(config)
+        await app.initialize()
+        
+        # Setup signal handlers
+        setup_signal_handlers(app)
+        
+        try:
+            # Start Sentry profiler
+            sentry_sdk.profiler.start_profiler()
+            
+            # Process repository
+            await process_repository(app, args)
+            
+        finally:
+            # Stop Sentry profiler
+            sentry_sdk.profiler.stop_profiler()
+            
+            # Cleanup
+            await app.cleanup()
+            
+    except ConfigurationError as e:
+        logging.error(f"Configuration error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        logging.debug("Stack trace:", exc_info=True)
+        sys.exit(1)
+
+def main():
+    """Main entry point."""
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nUnexpected error: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

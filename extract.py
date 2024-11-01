@@ -1,309 +1,201 @@
+"""
+Extraction module for analyzing code across multiple languages.
+
+This module provides functions to extract information from source code,
+including classes, functions, dependencies, and code metrics. It supports
+multiple programming languages and integrates with the hierarchy system
+and context management for comprehensive analysis.
+
+Classes:
+    ExtractionManager: Manages the extraction of code information across multiple languages.
+"""
+
 import ast
 import logging
-import re
-from utils import format_with_black
+from typing import Dict, List, Any, Optional, Set
+from pathlib import Path
+from multilang import MultiLanguageManager, BaseLanguageParser
+from hierarchy import CodeHierarchy
+from context_manager import ContextManager
+import sentry_sdk
 
-def calculate_cyclomatic_complexity(node):
-    """Calculate the cyclomatic complexity of a code segment represented by an AST node."""
-    complexity = 1  # Start with a base complexity of 1
-
-    # Iterate through the children of the node
-    for child in ast.walk(node):
-        if isinstance(child, (ast.If, ast.For, ast.While, ast.And, ast.Or, ast.ExceptHandler,
-                              ast.Try, ast.With, ast.BoolOp, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-            complexity += 1  # Increment complexity for control flow structures
-
-    return complexity
-
-def count_lines(node, content):
+class ExtractionManager:
     """
-    Count the number of code lines in a function or class.
+    Manages the extraction of code information across multiple languages.
     
-    Args:
-        node (ast.AST): The AST node of the function or class
-        content (str): The source code content
-        
-    Returns:
-        dict: Dictionary containing total_lines, code_lines, comment_lines, and blank_lines
+    This class coordinates between language-specific parsers and the
+    hierarchy system to extract and organize code information.
     """
-    try:
-        source = ast.get_source_segment(content, node)
-        if not source:
-            return {
-                "total_lines": 0,
-                "code_lines": 0,
-                "comment_lines": 0,
-                "blank_lines": 0
-            }
-            
-        lines = source.splitlines()
-        total_lines = len(lines)
-        blank_lines = sum(1 for line in lines if not line.strip())
-        comment_lines = sum(1 for line in lines if line.strip().startswith('#'))
-        code_lines = total_lines - blank_lines - comment_lines
+    
+    def __init__(self, 
+                 multilang_manager: MultiLanguageManager,
+                 hierarchy_manager: CodeHierarchy,
+                 context_manager: ContextManager,
+                 significant_operations: Optional[Set[str]] = None):
+        """
+        Initialize the extraction manager.
         
-        return {
-            "total_lines": total_lines,
-            "code_lines": code_lines,
-            "comment_lines": comment_lines,
-            "blank_lines": blank_lines
+        Args:
+            multilang_manager: Multi-language support manager
+            hierarchy_manager: Hierarchy management instance
+            context_manager: Context management instance
+            significant_operations: Set of significant operations to track
+        """
+        self.multilang_manager = multilang_manager
+        self.hierarchy_manager = hierarchy_manager
+        self.context_manager = context_manager
+        self.significant_operations = significant_operations or {
+            'open', 'connect', 'execute', 'write',
+            'read', 'send', 'recv'
         }
-    except Exception as e:
-        logging.warning(f"Error counting lines: {str(e)}")
-        return {
-            "total_lines": 0,
-            "code_lines": 0,
-            "comment_lines": 0,
-            "blank_lines": 0
-        }
-    
-def extract_dependencies(node, content):
-    """
-    Extract import dependencies and documentation-relevant information from a function.
-    
-    Args:
-        node (ast.AST): The AST node of the function
-        content (str): The source code content
         
-    Returns:
-        dict: Dictionary containing imports, function calls, and documentation-relevant info
-    """
-    dependencies = {
-        "imports": [],          # Standard import tracking
-        "internal_calls": [],   # Internal function calls
-        "external_calls": [],   # External function/method calls
-        "raises": [],          # Exceptions that might be raised
-        "affects": [],         # Side effects and state modifications
-        "uses": []            # Significant operations (file, db, network, etc.)
-    }
-    
-    try:
-        for child in ast.walk(node):
-            # Original import collection
-            if isinstance(child, (ast.Import, ast.ImportFrom)):
-                for name in child.names:
-                    module = child.module if isinstance(child, ast.ImportFrom) else name.name
-                    dependencies["imports"].append({
-                        "module": module,
-                        "name": name.name,
-                        "alias": name.asname,
-                        "is_type_hint": name.name == 'typing' or module == 'typing'
-                    })
-            
-            # Enhanced function call collection
-            elif isinstance(child, ast.Call):
-                if isinstance(child.func, ast.Name):
-                    dependencies["internal_calls"].append(child.func.id)
-                elif isinstance(child.func, ast.Attribute):
-                    call_info = f"{child.func.value.id}.{child.func.attr}"
-                    dependencies["external_calls"].append(call_info)
-                    
-                    # Track significant operations
-                    significant_ops = ['open', 'connect', 'execute', 'write', 'read', 'send', 'recv']
-                    if child.func.attr in significant_ops:
-                        dependencies["uses"].append({
-                            "operation": child.func.attr,
-                            "context": ast.get_source_segment(content, child)
-                        })
-            
-            # Exception tracking
-            elif isinstance(child, ast.Raise):
-                if isinstance(child.exc, ast.Name):
-                    dependencies["raises"].append({
-                        "exception": child.exc.id,
-                        "context": ast.get_source_segment(content, child)
-                    })
-                elif isinstance(child.exc, ast.Call) and isinstance(child.exc.func, ast.Name):
-                    dependencies["raises"].append({
-                        "exception": child.exc.func.id,
-                        "context": ast.get_source_segment(content, child)
-                    })
-            
-            # Side effects tracking
-            elif isinstance(child, ast.Assign):
-                if isinstance(child.targets[0], ast.Attribute) and \
-                   isinstance(child.targets[0].value, ast.Name) and \
-                   child.targets[0].value.id in ['self', 'cls']:
-                    dependencies["affects"].append({
-                        "attribute": child.targets[0].attr,
-                        "context": ast.get_source_segment(content, child)
-                    })
-                    
-    except Exception as e:
-        logging.warning(f"Error extracting dependencies: {str(e)}")
+    async def extract_code_elements(self, 
+                                    filepath: str, 
+                                    content: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Extract code elements from a file.
         
-    return dependencies
-    
-def generate_docstring_from_deps(func_name: str, doc_deps: dict) -> str:
-    """
-    Generate docstring sections based on dependency analysis.
-    """
-    docstring_parts = []
-    
-    # Add raises section if exceptions are found
-    if doc_deps["raises"]:
-        docstring_parts.append("Raises:")
-        for exc in doc_deps["raises"]:
-            docstring_parts.append(f"    {exc['exception']}: Based on {exc['context']}")
-    
-    # Add requirements section if critical imports exist
-    if doc_deps["required_imports"]:
-        docstring_parts.append("Requirements:")
-        for imp in doc_deps["required_imports"]:
-            docstring_parts.append(f"    - {imp['module']}.{imp['name']} for {imp['purpose']}")
-    
-    # Add important operations section
-    if doc_deps["uses"]:
-        docstring_parts.append("Important Operations:")
-        for op in doc_deps["uses"]:
-            docstring_parts.append(f"    - {op['operation']}: {op['context']}")
-    
-    # Add side effects section
-    if doc_deps["affects"]:
-        docstring_parts.append("Side Effects:")
-        for effect in doc_deps["affects"]:
-            docstring_parts.append(f"    - Modifies {effect['attribute']}")
-    
-    return "\n".join(docstring_parts)
-
-def extract_classes_and_functions_from_ast(tree, content):
-    """Extract class and function details from an AST."""
-    classes = []
-    functions = []
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            try:
-                # Add line count and dependencies to class info
-                line_stats = count_lines(node, content)
-                dependencies = extract_dependencies(node, content)
+        Args:
+            filepath: Path to the file
+            content: Optional file content
+            
+        Returns:
+            Dictionary containing extracted information
+        """
+        try:
+            # Process file with language detection
+            parsed_file = await self.multilang_manager.process_file(filepath, content)
+            
+            if parsed_file.errors:
+                return {'errors': parsed_file.errors}
                 
-                class_info = {
-                    "name": node.name,
-                    "docstring": ast.get_docstring(node) or "",
-                    "code": ast.get_source_segment(content, node),
-                    "methods": [],
-                    "complexity": calculate_cyclomatic_complexity(node),
-                    "line_stats": line_stats,
-                    "dependencies": dependencies,
-                    "node": node,
+            # Create hierarchy node for file
+            file_node = self.hierarchy_manager.add_node(
+                path=filepath,
+                node_type='file',
+                metadata={
+                    'language': parsed_file.language,
+                    'file_path': filepath
+                }
+            )
+            
+            # Extract elements based on language
+            extractor = self._get_language_extractor(parsed_file.language)
+            if extractor:
+                extracted_info = await extractor.extract_elements(
+                    parsed_file.content,
+                    filepath,
+                    self.significant_operations
+                )
+                
+                # Add to hierarchy and context
+                await self._process_extracted_elements(
+                    extracted_info,
+                    file_node,
+                    parsed_file.language
+                )
+                
+                return {
+                    'language': parsed_file.language,
+                    **extracted_info
                 }
                 
-                # Process methods
-                for body_item in node.body:
-                    if isinstance(body_item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        method_line_stats = count_lines(body_item, content)
-                        method_dependencies = extract_dependencies(body_item, content)
-                        
-                        methods.append({
-								    "name": method_name,
-								    "params": params,
-									 "return_type": return_type,
-									 "docstring": method_docstring,
-								    "code": method_code,
-								    "complexity": method_complexity,
-								    "dependencies": extract_dependencies(body_item, content),  # Make sure this is being used
-								    "node": body_item,
-								})
+            return {
+                'language': parsed_file.language,
+                'error': f'No extractor available for {parsed_file.language}'
+            }
+            
+        except Exception as e:
+            logging.error(f"Error extracting from {filepath}: {str(e)}")
+            sentry_sdk.capture_exception(e)
+            return {'error': str(e)}
+            
+    def _get_language_extractor(self, language: str) -> Optional[BaseLanguageParser]:
+        """Get the appropriate extractor for a language."""
+        spec = self.multilang_manager.specs.get(language)
+        return self.multilang_manager.get_parser(language, spec) if spec else None
+        
+    async def _process_extracted_elements(self,
+                                          elements: Dict[str, Any],
+                                          parent_node: Any,
+                                          language: str) -> None:
+        """
+        Process extracted elements and add to hierarchy/context.
+        
+        Args:
+            elements: Extracted code elements
+            parent_node: Parent node in hierarchy
+            language: Programming language
+        """
+        for element_type in ['classes', 'functions']:
+            for element in elements.get(element_type, []):
+                # Add to hierarchy
+                element_node = self.hierarchy_manager.add_node(
+                    path=f"{parent_node.get_path()}.{element['name']}",
+                    node_type=element_type.rstrip('s'),  # Remove plural
+                    documentation=element.get('docstring'),
+                    metadata={
+                        'language': language,
+                        'complexity': element.get('complexity'),
+                        'type': element_type,
+                        **element.get('metadata', {})
+                    }
+                )
                 
-                class_info["methods"] = methods
-                classes.append(class_info)
+                # Add to context manager
+                await self.context_manager.add_or_update_segment(
+                    f"{parent_node.get_path()}.{element['name']}",
+                    element['code'],
+                    {
+                        'language': language,
+                        'complexity': element.get('complexity'),
+                        'type': element_type
+                    }
+                )
                 
-            except Exception as e:
-                logging.warning(f"Error extracting class {getattr(node, 'name', 'unknown')}: {e}")
+                # Process nested elements (e.g., methods in classes)
+                if element_type == 'classes':
+                    await self._process_extracted_elements(
+                        {'functions': element.get('methods', [])},
+                        element_node,
+                        language
+                    )
 
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            try:
-                line_stats = count_lines(node, content)
-                dependencies = extract_dependencies(node, content)
-                
-                functions.append({
-					    "name": func_name,
-					    "params": params,
-					    "return_type": return_type,
-					    "docstring": docstring,
-					    "code": function_code,
-					    "complexity": function_complexity,
-					    "dependencies": extract_dependencies(node, content),  # Make sure this is being used
-					    "node": node,
-					})
-            except Exception as e:
-                logging.warning(f"Error extracting function {getattr(node, 'name', 'unknown')}: {e}")
-
-    return {"classes": classes, "functions": functions}
-
-def extract_basic_function_info(content):
+def extract_functions(
+    file_path: str,
+    content: str,
+    significant_operations: Optional[Set[str]] = None,
+    multilang_manager: Optional[MultiLanguageManager] = None,
+    hierarchy_manager: Optional[CodeHierarchy] = None,
+    context_manager: Optional[ContextManager] = None
+) -> Dict[str, List[Any]]:
     """
-    Extract basic function information when AST parsing fails.
-
-    This function uses regular expressions to extract basic information about
-    functions from the source code when AST parsing is unsuccessful.
-
+    Extract functions and classes from source code.
+    
     Args:
-        content (str): The source code content.
-
+        file_path: Path to the source file
+        content: Source code string
+        significant_operations: Optional set of operations to track
+        multilang_manager: Optional multi-language support manager
+        hierarchy_manager: Optional hierarchy manager
+        context_manager: Optional context manager
+        
     Returns:
-        list: A list of dictionaries containing basic function information.
+        Dictionary containing extracted classes and functions
     """
-    functions = []
-    # Regex pattern to match function definitions, including optional 'async' keyword
-    function_pattern = r"(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*$[^)]*$\s*:"
-
-    # Find all matches of the pattern in the content
-    matches = re.finditer(function_pattern, content)
-    for match in matches:
-        func_name = match.group(1)  # Extract the function name
-        start_idx = match.start()  # Start index of the function definition
-        next_def = content.find("\ndef ", start_idx + 1)  # Find the start of the next function
-        if next_def == -1:
-            next_def = len(content)  # If no more functions, go to the end of the content
-
-        # Extract the function code segment
-        function_code = content[start_idx:next_def].strip()
-
-        functions.append({
-            "name": func_name,
-            "params": [],  # Parameters are not extracted in this basic method
-            "return_type": "Unknown",  # Return type is not extracted in this basic method
-            "docstring": "",  # Docstring is not extracted in this basic method
-            "code": function_code,
-            "node": None,  # No AST node available
-            "parsing_error": True,  # Indicate that this was a fallback extraction
-        })
-
-    return functions
-
-def extract_functions(file_content):
-    """
-    Extract functions and classes with enhanced error handling.
-
-    This function attempts to parse the source code using the AST module and
-    extract function and class details. If parsing fails, it attempts to format
-    the code with Black and retry parsing.
-
-    Args:
-        file_content (str): The source code content of the file.
-
-    Returns:
-        dict: A dictionary containing lists of extracted classes and functions.
-
-    Raises:
-        Exception: If an error occurs during parsing or extraction.
-    """
-    try:
-        tree = ast.parse(file_content)
-        return extract_classes_and_functions_from_ast(tree, file_content)
-    except (IndentationError, SyntaxError) as e:
-        logging.warning(f"Initial parsing failed, attempting black formatting: {e}")
-
-        # Attempt to format the code with Black
-        success, formatted_content = format_with_black(file_content)
-        if success:
-            try:
-                tree = ast.parse(formatted_content)
-                return extract_classes_and_functions_from_ast(tree, formatted_content)
-            except (IndentationError, SyntaxError) as e:
-                logging.error(f"Parsing failed even after black formatting: {e}")
-
-        # Fallback to basic regex-based extraction
-        return extract_basic_function_info(file_content)
+    # Initialize managers if not provided
+    multilang_manager = multilang_manager or MultiLanguageManager()
+    hierarchy_manager = hierarchy_manager or CodeHierarchy()
+    context_manager = context_manager or ContextManager()
+    
+    # Create extraction manager
+    manager = ExtractionManager(
+        multilang_manager,
+        hierarchy_manager,
+        context_manager,
+        significant_operations
+    )
+    
+    # Run extraction asynchronously
+    import asyncio
+    return asyncio.run(manager.extract_code_elements(file_path, content))
