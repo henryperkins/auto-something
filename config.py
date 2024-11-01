@@ -18,15 +18,32 @@ Classes:
     HierarchyConfig: Configuration for hierarchy management.
     MultiLanguageConfig: Configuration for multi-language support.
     ContextOptimizerConfig: Configuration for context optimization.
+    SentryConfig: Configuration for Sentry settings.
     Config: Main configuration class encapsulating all settings.
 """
 
 import os
+import re
 import yaml
 import logging
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 from pydantic import BaseModel, Field, HttpUrl, validator, SecretStr, conint, confloat, DirectoryPath
+
+def resolve_env_variables(config_dict: dict) -> dict:
+    """
+    Recursively resolve environment variables in the configuration dictionary.
+
+    Replaces placeholders like ${VAR_NAME} with the actual environment variable values.
+    """
+    for key, value in config_dict.items():
+        if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+            env_var = value[2:-1]
+            resolved = os.getenv(env_var, "")
+            config_dict[key] = resolved
+        elif isinstance(value, dict):
+            resolve_env_variables(value)
+    return config_dict
 
 class BaseConfigModel(BaseModel):
     """Base configuration model with enhanced validation features."""
@@ -58,6 +75,22 @@ class BaseConfigModel(BaseModel):
             elif field_name in data:
                 processed_data[field_name] = data[field_name]
         return cls(**processed_data)
+
+class SentryConfig(BaseModel):
+    """Configuration for Sentry settings."""
+    dsn: SecretStr = Field(..., description="Sentry DSN")
+    traces_sample_rate: float = Field(1.0, description="Sample rate for tracing")
+    environment: str = Field("production", description="Environment name")
+    release: Optional[str] = Field(None, description="Release version")
+    debug: bool = Field(False, description="Enable debug mode")
+    attach_stacktrace: bool = Field(True, description="Attach stacktrace to events")
+    send_default_pii: bool = Field(False, description="Send default PII")
+
+    @validator('dsn')
+    def validate_dsn(cls, v):
+        if not v:
+            raise ValueError("Sentry DSN must be provided")
+        return v
 
 class OpenAIConfig(BaseConfigModel):
     """Configuration for OpenAI API settings."""
@@ -193,60 +226,38 @@ class Config(BaseConfigModel):
     concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
     extract: ExtractConfig = Field(default_factory=ExtractConfig)
-    exclude_dirs: List[str] = Field(
-        default_factory=lambda: [".git", ".github", "__pycache__", "venv"],
-        description="Directories to exclude"
-    )
     hierarchy: HierarchyConfig = Field(default_factory=HierarchyConfig)
     multilang: MultiLanguageConfig = Field(default_factory=MultiLanguageConfig)
     context_optimizer: ContextOptimizerConfig = Field(default_factory=ContextOptimizerConfig)
+    sentry: SentryConfig = Field(default_factory=SentryConfig)
+    exclude_dirs: List[str] = Field(
+        default_factory=lambda: [".git", ".github", "__pycache__", "venv"],
+        description="Directories to exclude from processing"
+    )
 
     @classmethod
-    def load(cls, config_path: Optional[str] = None) -> "Config":
-        """
-        Load configuration from a YAML file and environment variables.
-
-        Args:
-            config_path: Optional path to configuration file
-
-        Returns:
-            Config instance with validated settings
-
-        Raises:
-            ValueError: If configuration validation fails
-        """
-        try:
-            # Load configuration from file
-            config_data = {}
-            if config_path:
-                path = Path(config_path)
+    def load(cls, config_path: Optional[str] = None) -> Optional["Config"]:
+        """Load configuration from a YAML file and environment variables."""
+        config_data = {}
+        if config_path:
+            path = Path(config_path)
+            try:
                 if path.exists():
                     with open(path) as f:
                         config_data = yaml.safe_load(f)
-                else:
-                    logging.warning(f"Configuration file not found: {config_path}")
+                    
+                    # Resolve environment variables in config_data
+                    config_data = resolve_env_variables(config_data)
+            except (OSError, yaml.YAMLError) as e:
+                logging.error("Error loading configuration: %s", e, exc_info=True)
+                return None
 
-            # Create configuration instance with validation
-            config = cls(
-                openai=OpenAIConfig.from_dict(config_data.get("openai", {}), "OPENAI_"),
-                azure=AzureConfig.from_dict(config_data.get("azure", {}), "AZURE_") if config_data.get("azure") else None,
-                cache=CacheConfig.from_dict(config_data.get("cache", {}), "CACHE_"),
-                logging=LoggingConfig.from_dict(config_data.get("logging", {}), "LOG_"),
-                concurrency=ConcurrencyConfig.from_dict(config_data.get("concurrency", {}), "CONCURRENCY_"),
-                model=ModelConfig.from_dict(config_data.get("model", {}), "MODEL_"),
-                extract=ExtractConfig.from_dict(config_data.get("extract", {}), "EXTRACT_"),
-                hierarchy=HierarchyConfig.from_dict(config_data.get("hierarchy", {}), "HIERARCHY_"),
-                multilang=MultiLanguageConfig.from_dict(config_data.get("multilang", {}), "MULTILANG_"),
-                context_optimizer=ContextOptimizerConfig.from_dict(config_data.get("context_optimizer", {}), "CONTEXT_OPTIMIZER_"),
-                exclude_dirs=config_data.get("exclude_dirs", [".git", ".github", "__pycache__", "venv"])
-            )
-
-            # Perform cross-validation
-            config.validate_configuration()
+        try:
+            config = cls(**config_data)
             return config
-
         except Exception as e:
-            raise ValueError(f"Configuration validation failed: {str(e)}")
+            logging.error("Configuration validation failed: %s", e, exc_info=True)
+            return None
 
     def validate_configuration(self):
         """
@@ -363,6 +374,15 @@ def create_default_config(path: str = "config.yaml"):
                 'complexity': 0.3
             }
         },
+        'sentry': {
+            'dsn': '${SENTRY_DSN}',
+            'traces_sample_rate': 1.0,
+            'environment': 'production',
+            'release': 'my-project-name@2.3.12',
+            'debug': True,
+            'attach_stacktrace': True,
+            'send_default_pii': False
+        },
         'exclude_dirs': [
             '.git',
             '.github',
@@ -385,4 +405,7 @@ OPENAI_API_KEY=your-api-key-here
 AZURE_OPENAI_API_KEY=your-azure-key-here
 AZURE_OPENAI_ENDPOINT=https://your-resource-name.openai.azure.com
 AZURE_OPENAI_DEPLOYMENT_NAME=your-deployment-name-here
+
+# Sentry Configuration
+SENTRY_DSN=your-sentry-dsn-here
 """)

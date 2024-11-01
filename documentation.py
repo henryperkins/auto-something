@@ -24,7 +24,8 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 import sentry_sdk
 from utils import exponential_backoff_with_jitter
-from context_manager import ContextManager, ContextWindowManager
+from context_optimizer import ContextWindowManager
+from context_manager import ContextManager
 from hierarchy import CodeHierarchy
 from multilang import MultiLanguageManager
 from metadata_manager import MetadataManager

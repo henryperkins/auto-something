@@ -151,7 +151,7 @@ class CLIArguments(BaseModel):
     input_path: Union[str, HttpUrl]
     output_file: str
     concurrency: int = Field(default=5, ge=1, le=20)
-    service: str = Field(default="openai", regex="^(openai|azure)$")
+    service: str = Field(default="openai", pattern="^(openai|azure)$")
     config_file: Optional[str] = None
 
     @property

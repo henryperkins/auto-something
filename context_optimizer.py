@@ -308,4 +308,4 @@ class ContextWindowManager:
         """
         await self.optimize_window()
         async with self.lock:
->             return [(sid, code) for sid, code in self.current_segments.items()]
+            return [(sid, code) for sid, code in self.current_segments.items()]

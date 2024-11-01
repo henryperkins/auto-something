@@ -21,8 +21,8 @@ import sentry_sdk
 
 from utils import get_function_hash
 from documentation import DocumentationGenerator
-from context_manager import ContextManager, ContextWindowManager
-from dependency_analyzer import DependencyAnalyzer
+from context_manager import ContextManager
+from context_optimizer import ContextWindowManager
 from metadata_manager import MetadataManager
 from multilang import MultiLanguageManager
 from hierarchy import CodeHierarchy
