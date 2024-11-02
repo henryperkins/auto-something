@@ -25,13 +25,13 @@ import logging
 import shutil
 import signal
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
-from config import Config
+from config import Config, create_default_config
 from exceptions import ConfigurationError, WorkflowError
 from cache import Cache
 from validation import validate_input_files, validate_git_repository
@@ -50,25 +50,21 @@ load_dotenv()
 @dataclass
 class Statistics:
     """Container for documentation generation statistics."""
-    hierarchy: Dict[str, Any]
-    languages: Dict[str, int]
-    context: Dict[str, Any]
+    hierarchy: Dict[str, Any]  # Dictionary containing hierarchy stats
+    languages: Dict[str, int]  # Dictionary mapping language names to file counts
+    context: Dict[str, Any]   # Dictionary containing context window stats
+
 
 @dataclass
 class ApplicationManager:
-    """
-    Manages the application's core components and lifecycle.
-    
-    This class coordinates between different components and ensures proper
-    initialization and cleanup of resources.
-    """
-    config: Config
-    cache: Optional[Cache] = None
-    hierarchy: Optional[CodeHierarchy] = None
-    multilang_manager: Optional[MultiLanguageManager] = None
-    context_manager: Optional[ContextManager] = None
-    window_manager: Optional[ContextWindowManager] = None
-    metadata_manager: Optional[MetadataManager] = None
+    """Manages the application's core components and lifecycle."""
+    config: Config = field(compare=False)
+    cache: Optional[Cache] = field(default=None, compare=False)
+    hierarchy: Optional[CodeHierarchy] = field(default=None, compare=False)
+    multilang_manager: Optional[MultiLanguageManager] = field(default=None, compare=False)
+    context_manager: Optional[ContextManager] = field(default=None, compare=False)
+    window_manager: Optional[ContextWindowManager] = field(default=None, compare=False)
+    metadata_manager: Optional[MetadataManager] = field(default=None, compare=False)
 
     async def initialize(self):
         """Initialize application components."""
@@ -100,12 +96,45 @@ class ApplicationManager:
 
     async def get_statistics(self) -> Statistics:
         """Get documentation generation statistics."""
-        hierarchy_stats = self.hierarchy.get_stats() if self.hierarchy else {}
-        language_distribution = self.multilang_manager.get_language_distribution() if self.multilang_manager else {}
-        context_stats = self.context_manager.get_stats() if self.context_manager else {}
+        hierarchy_stats = {
+            'total_nodes': 0,
+            'max_depth': 0
+        }
+        language_stats = {}
+        context_stats = {
+            'total_segments': 0,
+            'total_tokens': 0,
+            'max_tokens': 0,
+            'utilization': 0.0
+        }
+
+        try:
+            # Get hierarchy statistics
+            if self.hierarchy:
+                hierarchy_stats.update(self.hierarchy.get_stats())
+
+            # Get language distribution
+            if self.multilang_manager:
+                language_stats = self.multilang_manager.get_language_stats()
+                if not isinstance(language_stats, dict):
+                    language_stats = {}
+
+            # Get context statistics
+            if self.context_manager and self.window_manager:
+                context_stats.update({
+                    'total_segments': self.context_manager.get_segment_count(),
+                    'total_tokens': self.window_manager.current_tokens,
+                    'max_tokens': self.window_manager.max_tokens,
+                    'utilization': self.window_manager.get_utilization()
+                })
+
+        except Exception as e:
+            logging.error(f"Error collecting statistics: {str(e)}")
+            sentry_sdk.capture_exception(e)
+
         return Statistics(
             hierarchy=hierarchy_stats,
-            languages=language_distribution,
+            languages=language_stats,
             context=context_stats
         )
     
@@ -301,8 +330,11 @@ def display_statistics(stats: Statistics) -> None:
     print(f"  Maximum Depth: {stats.hierarchy.get('max_depth', 'N/A')}")
     
     print("\nLanguage Distribution:")
-    for lang, count in stats.languages.items():
-        print(f"  {lang}: {count} files")
+    if isinstance(stats.languages, dict):
+        for lang, count in stats.languages.items():
+            print(f"  {lang}: {count} files")
+    else:
+        print("  No language statistics available")
     
     print("\nContext Statistics:")
     print(f"  Total Segments: {stats.context.get('total_segments', 'N/A')}")
@@ -320,10 +352,9 @@ def setup_signal_handlers(app: ApplicationManager):
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-async def main_async(args: argparse.Namespace) -> None:
+async def main_async(args: argparse.Namespace, config: Config) -> None:
     """Asynchronous main function."""
     try:
-        config = Config.load(args.config)
         app = ApplicationManager(config=config)
         setup_signal_handlers(app)
         await app.initialize()
@@ -341,29 +372,40 @@ def main():
     """Main entry point."""
     parser = create_arg_parser()
     args = parser.parse_args()
-    setup_logging(args.config)  # Pass the config parameter
+    setup_logging()  # Initial basic logging setup
 
     if args.create_config:
         create_default_config(args.config)
         logging.info(f"Created default configuration at {args.config}")
         sys.exit(0)
 
-    # Setup logging
-    setup_logging(args.config)
+    # Load configuration
+    config = Config.load(args.config)
+    if not config:
+        logging.error("Failed to load configuration")
+        sys.exit(1)
+
+    # Setup logging with loaded config
+    setup_logging(config)
 
     # Initialize Sentry if configured
-    if args.config.sentry.enabled:
-        sentry_sdk.init(
-            dsn=args.config.sentry.dsn.get_secret_value(),
-            traces_sample_rate=args.config.sentry.traces_sample_rate,
-            environment=args.config.sentry.environment,
-            release=args.config.sentry.release,
-            debug=args.config.sentry.debug,
-            attach_stacktrace=args.config.sentry.attach_stacktrace,
-            send_default_pii=args.config.sentry.send_default_pii
-        )
+    if config.sentry and config.sentry.enabled:
+        if not config.sentry.dsn:
+            logging.warning("Sentry is enabled but DSN is not configured")
+        else:
+            sentry_sdk.init(
+                dsn=config.sentry.dsn.get_secret_value(),
+                traces_sample_rate=config.sentry.traces_sample_rate,
+                environment=config.sentry.environment,
+                release=config.sentry.release,
+                debug=config.sentry.debug,
+                attach_stacktrace=config.sentry.attach_stacktrace,
+                send_default_pii=config.sentry.send_default_pii
+            )
+            logging.info("Sentry initialized successfully")
 
-    asyncio.run(main_async(args))
+    asyncio.run(main_async(args, config))  # Pass config to main_async
+
 
 if __name__ == "__main__":
     main()

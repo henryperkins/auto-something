@@ -29,7 +29,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Set
 from pydantic import BaseModel, Field, HttpUrl, validator, SecretStr, conint, confloat, DirectoryPath
-
+from dataclasses import dataclass
 def resolve_env_variables(config_dict: dict) -> dict:
     """
     Recursively resolve environment variables in the configuration dictionary.
@@ -76,20 +76,22 @@ class BaseConfigModel(BaseModel):
                 processed_data[field_name] = data[field_name]
         return cls(**processed_data)
 
-class SentryConfig(BaseModel):
-    """Configuration for Sentry settings."""
-    dsn: SecretStr = Field(..., description="Sentry DSN")
-    traces_sample_rate: float = Field(1.0, description="Sample rate for tracing")
-    environment: str = Field("production", description="Environment name")
+class SentryConfig(BaseConfigModel):
+    """Configuration for Sentry error tracking."""
+    enabled: bool = Field(False, description="Enable/disable Sentry integration")
+    dsn: Optional[SecretStr] = Field(None, description="Sentry DSN")
+    traces_sample_rate: float = Field(1.0, description="Traces sample rate")
+    environment: Optional[str] = Field("development", description="Environment name")  
     release: Optional[str] = Field(None, description="Release version")
     debug: bool = Field(False, description="Enable debug mode")
-    attach_stacktrace: bool = Field(True, description="Attach stacktrace to events")
+    attach_stacktrace: bool = Field(True, description="Attach stacktraces")
     send_default_pii: bool = Field(False, description="Send default PII")
 
-    @validator('dsn')
-    def validate_dsn(cls, v):
-        if not v:
-            raise ValueError("Sentry DSN must be provided")
+    @validator('dsn', always=True)
+    def validate_dsn_if_enabled(cls, v, values):
+        """Validate DSN is provided when Sentry is enabled."""
+        if values.get('enabled', False) and not v:
+            raise ValueError("Sentry DSN is required when Sentry is enabled")
         return v
 
 class OpenAIConfig(BaseConfigModel):
@@ -200,22 +202,33 @@ class MultiLanguageConfig(BaseConfigModel):
     parser_timeout: int = Field(30, description="Parser timeout in seconds")
     fallback_language: str = Field("python", description="Fallback language if detection fails")
 
-class ContextOptimizerConfig(BaseConfigModel):
-    """Configuration for context optimization."""
-    enabled: bool = Field(True, description="Enable context optimization")
-    target_token_usage: float = Field(0.9, description="Target token usage ratio")
+class ContextOptimizerConfig(BaseModel):
+    """Configuration for context optimization settings."""
+    enabled: bool = Field(True, description="Enable/disable context optimization")
+    max_context_length: int = Field(2048, description="Maximum context length for optimization")
+    target_token_usage: float = Field(
+        0.9,
+        ge=0.0,
+        le=1.0,
+        description="Target token utilization for context optimization"
+    )
     prediction_confidence_threshold: float = Field(
         0.8,
-        description="Minimum confidence for token predictions"
+        ge=0.0,
+        le=1.0,
+        description="Confidence threshold for predictions"
     )
     priority_weights: Dict[str, float] = Field(
         default_factory=lambda: {
-            "usage_frequency": 0.4,
-            "modification_recency": 0.3,
-            "complexity": 0.3
+            'usage_frequency': 0.4,
+            'modification_recency': 0.3,
+            'complexity': 0.3
         },
-        description="Weights for priority calculations"
+        description="Weights for prioritizing code segments"
     )
+
+    class Config:
+        frozen = True  # Ma
 
 class Config(BaseConfigModel):
     """Main configuration class encapsulating all settings."""

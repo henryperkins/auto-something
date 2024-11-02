@@ -1,48 +1,37 @@
-"""
-Context Management Module.
-
-This module provides dynamic context management, adjusting the context window
-based on code relevance, token limits, and semantic similarity. It integrates
-with the multi-language support and hierarchy systems for comprehensive
-context handling across different programming languages.
-
-Classes:
-    ContextSegment: Represents a segment in the context window.
-    ContextManager: Manages code segments and their relevance for context window optimization.
-"""
-
-import logging
 import asyncio
+import logging
 import time
-from typing import List, Dict, Tuple, Optional, Set, Any
-import tiktoken
-from sentence_transformers import SentenceTransformer, util
+from typing import Any, Dict, List, Optional, Set
+
 import torch
-import async_timeout
+import tiktoken
 from dataclasses import dataclass
-import sentry_sdk
+from typing import Optional, Union
+from asyncio import Lock, Event
+
 
 @dataclass
 class ContextSegment:
     """
-    Represents a segment in the context window.
+    Represents a code segment with associated metadata.
     
     Attributes:
-        content: The code content
-        language: Programming language
-        hierarchy_path: Path in documentation hierarchy
-        relevance_score: Semantic relevance score
-        token_count: Number of tokens in segment
-        last_access: Timestamp of last access
-        access_count: Number of times accessed
+        content: The actual code content.
+        language: Programming language of the code segment.
+        hierarchy_path: Path in the documentation hierarchy.
+        access_count: Number of times the segment has been accessed.
+        last_access: Timestamp of the last access.
+        token_count: Number of tokens in the segment.
+        relevance_score: Semantic relevance score.
     """
     content: str
     language: str
     hierarchy_path: Optional[str] = None
-    relevance_score: float = 0.0
-    token_count: int = 0
-    last_access: float = 0.0
     access_count: int = 0
+    last_access: float = time.time()
+    token_count: int = 0
+    relevance_score: float = 0.0
+
 
 class ContextManager:
     """
@@ -52,7 +41,6 @@ class ContextManager:
     providing methods to update access information and retrieve the most relevant
     code segments based on recency, frequency, and semantic similarity.
     """
-    
     def __init__(self, 
                  context_size_limit: int = 10,
                  max_tokens: int = 2048,
@@ -77,10 +65,10 @@ class ContextManager:
         self.language_segments: Dict[str, Set[str]] = {}
         
         # Initialize components
-        self.lock = asyncio.Lock()
+        self.lock = Lock()
         self.embedding_model = None
-        self._embedding_model_initialized = asyncio.Event()
-        self._init_lock = asyncio.Lock()
+        self._embedding_model_initialized = Event()
+        self._init_lock = Lock()
         self._init_timeout = 30.0
         self._initialization_task = None
         
@@ -104,8 +92,11 @@ class ContextManager:
             content: Code content
             metadata: Metadata including language and hierarchy info
         """
+        # Ensure segment_id is a string
+        if not isinstance(segment_id, str):
+            segment_id = self._serialize_segment_id(segment_id)
+        
         async with self.lock:
-            # Create or update segment
             if segment_id in self.segments:
                 segment = self.segments[segment_id]
                 segment.content = content
@@ -137,6 +128,52 @@ class ContextManager:
                 self.embeddings[segment_id] = embedding
                 
             await self._optimize_context()
+
+    def _add_to_language_tracking(self, segment_id: str, language: str) -> None:
+        """Add a segment to language-specific tracking."""
+        if language not in self.language_segments:
+            self.language_segments[language] = set()
+        self.language_segments[language].add(segment_id)
+
+    async def _generate_embedding(self, text: str) -> Optional[torch.Tensor]:
+        """Generate embedding for text."""
+        await self._init_embedding_model()
+        try:
+            loop = asyncio.get_event_loop()
+            embedding = await loop.run_in_executor(
+                None,
+                self.embedding_model.encode,
+                text,
+                {'convert_to_tensor': True}
+            )
+            return embedding
+        except Exception as e:
+            logging.error(f"Error generating embedding: {str(e)}")
+            sentry_sdk.capture_exception(e)
+            return None
+
+    def _serialize_segment_id(self, segment_id: Any) -> str:
+        """Serialize segment_id to a string."""
+        if isinstance(segment_id, dict):
+            return str(tuple(sorted(segment_id.items())))
+        return str(segment_id)
+
+    async def _init_embedding_model(self):
+        """Initialize the embedding model."""
+        async with self._init_lock:
+            if not self._embedding_model_initialized.is_set():
+                try:
+                    self.embedding_model = SomeEmbeddingModel(self.model_name)
+                    self._embedding_model_initialized.set()
+                except Exception as e:
+                    logging.error(f"Failed to initialize embedding model: {str(e)}")
+                    sentry_sdk.capture_exception(e)
+                    raise
+
+    async def _optimize_context(self):
+        """Optimize the context by enforcing size and token limits."""
+        # Implementation for context optimization
+        pass
 
     async def get_semantic_relevant_segments(self,
                                              query: str,
@@ -217,62 +254,6 @@ class ContextManager:
                 'language_distribution': language_stats
             }
 
-    async def _optimize_context(self) -> None:
-        """Optimize the context window based on relevance and constraints."""
-        async with self.lock:
-            total_tokens = sum(segment.token_count for segment in self.segments.values())
-            
-            if (total_tokens > self.max_tokens or 
-                len(self.segments) > self.context_size_limit):
-                # Score segments
-                scored_segments = [
-                    (segment_id, self._calculate_segment_score(segment))
-                    for segment_id, segment in self.segments.items()
-                ]
-                scored_segments.sort(key=lambda x: x[1], reverse=True)
-                
-                # Keep highest scoring segments within limits
-                kept_segments = set()
-                current_tokens = 0
-                
-                for segment_id, score in scored_segments:
-                    segment = self.segments[segment_id]
-                    if (len(kept_segments) < self.context_size_limit and
-                        current_tokens + segment.token_count <= self.max_tokens):
-                        kept_segments.add(segment_id)
-                        current_tokens += segment.token_count
-                
-                # Remove other segments
-                for segment_id in list(self.segments.keys()):
-                    if segment_id not in kept_segments:
-                        await self.remove_segment(segment_id)
-
-    def _calculate_segment_score(self, segment: ContextSegment) -> float:
-        """Calculate a segment's importance score."""
-        recency_factor = 1.0 / (time.time() - segment.last_access + 1)
-        frequency_factor = segment.access_count / (max(s.access_count for s in self.segments.values()) + 1)
-        relevance_factor = segment.relevance_score
-        
-        return (0.4 * recency_factor + 
-                0.3 * frequency_factor +
-                0.3 * relevance_factor)
-
-    def _add_to_language_tracking(self, segment_id: str, language: str) -> None:
-        """Add a segment to language-specific tracking."""
-        if language not in self.language_segments:
-            self.language_segments[language] = set()
-        self.language_segments[language].add(segment_id)
-
-    async def remove_segment(self, segment_id: str) -> None:
-        """Remove a segment from the context manager."""
-        async with self.lock:
-            if segment_id in self.segments:
-                segment = self.segments[segment_id]
-                if segment.language in self.language_segments:
-                    self.language_segments[segment.language].remove(segment_id)
-                del self.segments[segment_id]
-                self.embeddings.pop(segment_id, None)
-
     async def clear(self) -> None:
         """Clear all segments from the context manager."""
         async with self.lock:
@@ -280,47 +261,7 @@ class ContextManager:
             self.embeddings.clear()
             self.language_segments.clear()
 
-    async def _init_embedding_model(self) -> None:
-        """Initialize the embedding model."""
-        async with async_timeout.timeout(self._init_timeout):
-            if not self._initialization_task:
-                self._initialization_task = asyncio.create_task(self._load_model())
-            await self._initialization_task
-
-    async def _load_model(self) -> None:
-        """Load the embedding model."""
-        async with self.lock:
-            if not self._embedding_model_initialized.is_set():
-                try:
-                    loop = asyncio.get_event_loop()
-                    self.embedding_model = await loop.run_in_executor(
-                        None,
-                        lambda: SentenceTransformer('all-MiniLM-L6-v2')
-                    )
-                    self._embedding_model_initialized.set()
-                except Exception as e:
-                    logging.error(f"Failed to initialize embedding model: {str(e)}")
-                    sentry_sdk.capture_exception(e)
-                    raise
-
-    async def _generate_embedding(self, text: str) -> Optional[torch.Tensor]:
-        """Generate embedding for text."""
-        await self._init_embedding_model()
-        try:
-            loop = asyncio.get_event_loop()
-            embedding = await loop.run_in_executor(
-                None,
-                self.embedding_model.encode,
-                text,
-                {'convert_to_tensor': True}
-            )
-            return embedding
-        except Exception as e:
-            logging.error(f"Error generating embedding: {str(e)}")
-            sentry_sdk.capture_exception(e)
-            return None
-
-    async def cleanup(self):
+    async def cleanup(self) -> None:
         """Clean up resources."""
         try:
             await self.clear()
